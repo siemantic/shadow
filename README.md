@@ -1,5 +1,7 @@
 # The Shadow Simulator
 
+master: [![Build Status](https://travis-ci.org/shadow/shadow.svg?branch=master)](https://travis-ci.org/shadow/shadow)
+
 Shadow is a unique discrete-event network simulator that runs real 
 applications like Tor and Bitcoin, and distributed systems of thousands of
 nodes on a single machine. Shadow combines the accuracy of emulation with the 
