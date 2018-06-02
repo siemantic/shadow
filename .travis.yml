@@ -1,0 +1,22 @@
+addons:
+  apt:
+    packages:
+    - gcc
+    - g++
+    - cmake
+    - make
+    - xz-utils
+    - python
+    - libglib2.0-0
+    - libglib2.0-dev
+    - libigraph0v5
+    - libigraph0-dev
+    - libc-dbg
+
+compiler: gcc
+
+script:
+    python ./setup build --clean
+    python ./setup install
+    python ./setup test
+
