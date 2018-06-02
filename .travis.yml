@@ -17,7 +17,7 @@ compiler:
     - gcc
 
 script:
-    - python ./setup build --clean
+    - python ./setup build --clean --test
     - python ./setup install
     - python ./setup test
 
