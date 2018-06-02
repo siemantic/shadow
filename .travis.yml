@@ -13,7 +13,8 @@ addons:
     - libigraph0-dev
     - libc-dbg
 
-compiler: gcc
+compiler:
+    - gcc
 
 script:
     python ./setup build --clean
