@@ -13,6 +13,9 @@ struct _Host {
 
     HostParameters params;
 
+    /* The router upstream from the host, from which we receive packets. */
+    Router* router;
+
     GHashTable* interfaces;
     Address* defaultAddress;
     CPU* cpu;
@@ -158,6 +161,12 @@ void host_setup(Host* host, DNS* dns, Topology* topology, guint rawCPUFreq, cons
     g_hash_table_replace(host->interfaces, GUINT_TO_POINTER((guint)address_toNetworkIP(ethernetAddress)), ethernet);
     g_hash_table_replace(host->interfaces, GUINT_TO_POINTER((guint)htonl(INADDR_LOOPBACK)), loopback);
 
+    /* the upstream router that will queue packets until we can receive them.
+     * this only applies the the ethernet interface, the loopback interface
+     * does not receive packets from a router. */
+    host->router = router_new(QUEUE_MANAGER_CODEL, ethernet);
+    networkinterface_setRouter(ethernet, host->router);
+
     address_unref(loopbackAddress);
     address_unref(ethernetAddress);
 
@@ -199,6 +208,10 @@ void host_shutdown(Host* host) {
 
     if(host->interfaces) {
         g_hash_table_destroy(host->interfaces);
+    }
+
+    if(host->router) {
+        router_unref(host->router);
     }
 
     if(host->descriptors) {
@@ -324,6 +337,16 @@ void host_boot(Host* host) {
     /* must be done after the default IP exists so tracker_heartbeat works */
     host->tracker = tracker_new(host->params.heartbeatInterval, host->params.heartbeatLogLevel, host->params.heartbeatLogInfo);
 
+    /* start refilling the token buckets for all interfaces */
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, host->interfaces);
+
+    while(g_hash_table_iter_next(&iter, &key, &value)) {
+        NetworkInterface* interface = value;
+        networkinterface_startRefillingTokenBuckets(interface);
+    }
+
     /* scheduling the starting and stopping of our virtual processes */
     g_queue_foreach(host->processes, (GFunc)process_schedule, NULL);
 }
@@ -436,6 +459,13 @@ Descriptor* host_lookupDescriptor(Host* host, gint handle) {
 NetworkInterface* host_lookupInterface(Host* host, in_addr_t handle) {
     MAGIC_ASSERT(host);
     return g_hash_table_lookup(host->interfaces, GUINT_TO_POINTER(handle));
+}
+
+Router* host_getUpstreamRouter(Host* host, in_addr_t handle) {
+    MAGIC_ASSERT(host);
+    NetworkInterface* interface = g_hash_table_lookup(host->interfaces, GUINT_TO_POINTER(handle));
+    utility_assert(interface != NULL);
+    return networkinterface_getRouter(interface);
 }
 
 static void _host_associateInterface(Host* host, Socket* socket,

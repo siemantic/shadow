@@ -6,46 +6,51 @@
 
 #include "shadow.h"
 
-typedef enum _NetworkInterfaceFlags NetworkInterfaceFlags;
-enum _NetworkInterfaceFlags {
-    NIF_NONE = 0,
-    NIF_SENDING = 1 << 0,
-    NIF_RECEIVING = 1 << 1,
+typedef struct _NetworkInterfaceTokenBucket NetworkInterfaceTokenBucket;
+struct _NetworkInterfaceTokenBucket {
+    /* The maximum number of bytes the bucket can hold */
+    guint64 bytesCapacity;
+    /* The number of bytes remaining in the bucket */
+    guint64 bytesRemaining;
+    /* The number of bytes that get added to the bucket every millisecond */
+    guint64 bytesRefill;
 };
 
 struct _NetworkInterface {
-    NetworkInterfaceFlags flags;
+    /* The upstream ISP router connected to this interface.
+     * May be NULL for loopback interfaces. */
+    Router* router;
+
+    /* The queuing discipline used by this interface to schedule the
+     * sending of packets from sockets. */
     QDiscMode qdisc;
 
+    /* The address associated with this interface */
     Address* address;
-
-    guint64 bwDownKiBps;
-    gdouble timePerByteDown;
-    guint64 bwUpKiBps;
-    gdouble timePerByteUp;
 
     /* (protocol,port)-to-socket bindings */
     GHashTable* boundSockets;
-
-    /* NIC input queue */
-    GQueue* inBuffer;
-    gsize inBufferSize;
-    gsize inBufferLength;
 
     /* Transports wanting to send data out */
     GQueue* rrQueue;
     PriorityQueue* fifoQueue;
 
-    /* bandwidth accounting */
-    SimulationTime lastTimeReceived;
-    SimulationTime lastTimeSent;
-    gdouble sendNanosecondsConsumed;
-    gdouble receiveNanosecondsConsumed;
+    /* the outgoing token bucket implements traffic shaping, i.e.,
+     * packets are delayed until they conform with outgoing rate limits.*/
+    NetworkInterfaceTokenBucket sendBucket;
 
+    /* the incoming token bucket implements traffic policing, i.e.,
+     * packets that do not conform to incoming rate limits are dropped. */
+    NetworkInterfaceTokenBucket receiveBucket;
+
+    /* To support capturing incoming and outgoing packets */
     PCapWriter* pcap;
 
     MAGIC_DECLARE;
 };
+
+/* forward declaration */
+static void _networkinterface_sendPackets(NetworkInterface* interface);
 
 static gint _networkinterface_compareSocket(const Socket* sa, const Socket* sb, gpointer userData) {
     Packet* pa = socket_peekNextPacket(sa);
@@ -53,82 +58,139 @@ static gint _networkinterface_compareSocket(const Socket* sa, const Socket* sb, 
     return packet_getPriority(pa) > packet_getPriority(pb) ? +1 : -1;
 }
 
-NetworkInterface* networkinterface_new(Address* address, guint64 bwDownKiBps, guint64 bwUpKiBps,
-        gboolean logPcap, gchar* pcapDir, QDiscMode qdisc, guint64 interfaceReceiveLength) {
-    NetworkInterface* interface = g_new0(NetworkInterface, 1);
-    MAGIC_INIT(interface);
-
-    interface->address = address;
-    address_ref(interface->address);
-
-    /* interface speeds */
-    interface->bwUpKiBps = bwUpKiBps;
-    gdouble bytesPerSecond = (gdouble)(bwUpKiBps * 1024);
-    interface->timePerByteUp = (gdouble) (((gdouble)SIMTIME_ONE_SECOND) / bytesPerSecond);
-    interface->bwDownKiBps = bwDownKiBps;
-    bytesPerSecond = (gdouble)(bwDownKiBps * 1024);
-    interface->timePerByteDown = (gdouble) (((gdouble)SIMTIME_ONE_SECOND) / bytesPerSecond);
-
-    /* incoming packet buffer */
-    interface->inBuffer = g_queue_new();
-    interface->inBufferSize = interfaceReceiveLength;
-
-    /* incoming packets get passed along to sockets */
-    interface->boundSockets = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, descriptor_unref);
-
-    /* sockets tell us when they want to start sending */
-    interface->rrQueue = g_queue_new();
-    interface->fifoQueue = priorityqueue_new((GCompareDataFunc)_networkinterface_compareSocket, NULL, descriptor_unref);
-
-    /* parse queuing discipline */
-    interface->qdisc = (qdisc == QDISC_MODE_NONE) ? QDISC_MODE_FIFO : qdisc;
-
-    if(logPcap) {
-        GString* filename = g_string_new(NULL);
-        g_string_printf(filename, "%s-%s",
-                address_toHostName(interface->address),
-                address_toHostIPString(interface->address));
-        interface->pcap = pcapwriter_new(pcapDir, filename->str);
-        g_string_free(filename, TRUE);
-    }
-
-    info("bringing up network interface '%s' at '%s', %"G_GUINT64_FORMAT" KiB/s up and %"G_GUINT64_FORMAT" KiB/s down using queuing discipline %s",
-            address_toHostName(interface->address), address_toHostIPString(interface->address), bwUpKiBps, bwDownKiBps,
-            interface->qdisc == QDISC_MODE_RR ? "rr" : "fifo");
-
-    return interface;
+static inline SimulationTime _networkinterface_getRefillIntervalSend() {
+    return (SimulationTime) SIMTIME_ONE_MILLISECOND*1;
 }
 
-void networkinterface_free(NetworkInterface* interface) {
+static inline SimulationTime _networkinterface_getRefillIntervalReceive() {
+    return (SimulationTime) SIMTIME_ONE_MILLISECOND*1;
+}
+
+static inline guint64 _networkinterface_getCapacityFactorSend() {
+    /* the capacity is this much times the refill rate */
+    return (guint64) 1;
+}
+
+static inline guint64 _networkinterface_getCapacityFactorReceive() {
+    /* the capacity is this much times the refill rate */
+    return (guint64) 1;
+}
+
+static void _networkinterface_refillTokenBucket(NetworkInterfaceTokenBucket* bucket) {
+    bucket->bytesRemaining += bucket->bytesRefill;
+    if(bucket->bytesRemaining > bucket->bytesCapacity) {
+        bucket->bytesRemaining = bucket->bytesCapacity;
+    }
+}
+
+static inline void _networkinterface_scheduleRefillTask(NetworkInterface* interface,
+        TaskCallbackFunc func, SimulationTime delay) {
+    Task* refillTask = task_new(func, interface, NULL, NULL, NULL);
+    worker_scheduleTask(refillTask, delay);
+    task_unref(refillTask);
+}
+
+static void _networkinterface_refillTokenBucketsBoth(NetworkInterface* interface, gpointer userData) {
     MAGIC_ASSERT(interface);
 
-    /* unref all packets sitting in our input buffer */
-    while(interface->inBuffer && !g_queue_is_empty(interface->inBuffer)) {
-        Packet* packet = g_queue_pop_head(interface->inBuffer);
-        packet_unref(packet);
+    /* add more bytes to the token buckets */
+    _networkinterface_refillTokenBucket(&interface->receiveBucket);
+    _networkinterface_refillTokenBucket(&interface->sendBucket);
+
+    /* call back when we need the next refill */
+    utility_assert(_networkinterface_getRefillIntervalSend() ==
+            _networkinterface_getRefillIntervalReceive());
+
+    _networkinterface_scheduleRefillTask(interface,
+            (TaskCallbackFunc) _networkinterface_refillTokenBucketsBoth,
+            _networkinterface_getRefillIntervalReceive());
+
+    /* the refill may have caused us to be able to receive and send again.
+     * we only receive packets from an upstream router if we have one (i.e.,
+     * if this is not a loopback interface). */
+    if(interface->router) {
+        networkinterface_receivePackets(interface);
     }
-    g_queue_free(interface->inBuffer);
+    _networkinterface_sendPackets(interface);
+}
 
-    /* unref all sockets wanting to send */
-    while(interface->rrQueue && !g_queue_is_empty(interface->rrQueue)) {
-        Socket* socket = g_queue_pop_head(interface->rrQueue);
-        descriptor_unref(socket);
+static void _networkinterface_refillTokenBucketSend(NetworkInterface* interface, gpointer userData) {
+    MAGIC_ASSERT(interface);
+
+    /* add more bytes to the token buckets */
+    _networkinterface_refillTokenBucket(&interface->sendBucket);
+
+    /* call back when we need the next refill */
+    _networkinterface_scheduleRefillTask(interface,
+            (TaskCallbackFunc) _networkinterface_refillTokenBucketSend,
+            _networkinterface_getRefillIntervalSend());
+
+    /* the refill may have caused us to be able to send again */
+    _networkinterface_sendPackets(interface);
+}
+
+static void _networkinterface_refillTokenBucketReceive(NetworkInterface* interface, gpointer userData) {
+    MAGIC_ASSERT(interface);
+
+    /* add more bytes to the token buckets */
+    _networkinterface_refillTokenBucket(&interface->receiveBucket);
+
+    /* call back when we need the next refill */
+    _networkinterface_scheduleRefillTask(interface,
+            (TaskCallbackFunc) _networkinterface_refillTokenBucketReceive,
+            _networkinterface_getRefillIntervalReceive());
+
+    /* the refill may have caused us to be able to receive again.
+     * we only receive packets from an upstream router if we have one (i.e.,
+     * if this is not a loopback interface). */
+    if(interface->router) {
+        networkinterface_receivePackets(interface);
     }
-    g_queue_free(interface->rrQueue);
+}
 
-    priorityqueue_free(interface->fifoQueue);
-
-    g_hash_table_destroy(interface->boundSockets);
-
-    dns_deregister(worker_getDNS(), interface->address);
-    address_unref(interface->address);
-
-    if(interface->pcap) {
-        pcapwriter_free(interface->pcap);
+void networkinterface_startRefillingTokenBuckets(NetworkInterface* interface) {
+    MAGIC_ASSERT(interface);
+    if(_networkinterface_getRefillIntervalSend() == _networkinterface_getRefillIntervalReceive()) {
+        _networkinterface_refillTokenBucketsBoth(interface, NULL);
+    } else {
+        _networkinterface_refillTokenBucketReceive(interface, NULL);
+        _networkinterface_refillTokenBucketSend(interface, NULL);
     }
+}
 
-    MAGIC_CLEAR(interface);
-    g_free(interface);
+static void _networkinterface_setupTokenBuckets(NetworkInterface* interface,
+        guint64 bwDownKiBps, guint64 bwUpKiBps) {
+    MAGIC_ASSERT(interface);
+
+    /* set up the token buckets */
+    g_assert(_networkinterface_getRefillIntervalSend() <= SIMTIME_ONE_SECOND);
+    SimulationTime timeFactorSend = SIMTIME_ONE_SECOND / _networkinterface_getRefillIntervalSend();
+    guint64 bytesPerIntervalSend = bwUpKiBps * 1024 / timeFactorSend;
+
+    g_assert(_networkinterface_getRefillIntervalReceive() <= SIMTIME_ONE_SECOND);
+    SimulationTime timeFactorReceive = SIMTIME_ONE_SECOND / _networkinterface_getRefillIntervalReceive();
+    guint64 bytesPerIntervalReceive = bwDownKiBps * 1024 / timeFactorReceive;
+
+    interface->receiveBucket.bytesRefill = bytesPerIntervalReceive;
+    interface->sendBucket.bytesRefill = bytesPerIntervalSend;
+
+    /* the CONFIG_MTU parts make sure we don't lose any partial bytes we had left
+     * from last round when we do the refill. */
+
+    guint64 sendFactor = _networkinterface_getCapacityFactorSend();
+    interface->sendBucket.bytesCapacity = (interface->sendBucket.bytesRefill * sendFactor) + CONFIG_MTU;
+
+    guint64 receiveFactor = _networkinterface_getCapacityFactorReceive();
+    interface->receiveBucket.bytesCapacity = (interface->receiveBucket.bytesRefill * receiveFactor) + CONFIG_MTU;
+
+    info("interface %s token buckets can send %"G_GUINT64_FORMAT" bytes "
+            "every %"G_GUINT64_FORMAT" nanoseconds",
+            address_toString(interface->address), interface->sendBucket.bytesRefill,
+            _networkinterface_getRefillIntervalSend());
+    info("interface %s token buckets can receive %"G_GUINT64_FORMAT" bytes "
+            "every %"G_GUINT64_FORMAT" nanoseconds",
+            address_toString(interface->address), interface->receiveBucket.bytesRefill,
+            _networkinterface_getRefillIntervalReceive());
 }
 
 Address* networkinterface_getAddress(NetworkInterface* interface) {
@@ -138,12 +200,22 @@ Address* networkinterface_getAddress(NetworkInterface* interface) {
 
 guint32 networkinterface_getSpeedUpKiBps(NetworkInterface* interface) {
     MAGIC_ASSERT(interface);
-    return interface->bwUpKiBps;
+
+    SimulationTime timeFactor = SIMTIME_ONE_SECOND / _networkinterface_getRefillIntervalSend();
+    guint64 bytesPerSecond = ((guint64)interface->sendBucket.bytesRefill) * ((guint64)timeFactor);
+    guint64 kibPerSecond = bytesPerSecond / 1024;
+
+    return (guint32)kibPerSecond;
 }
 
 guint32 networkinterface_getSpeedDownKiBps(NetworkInterface* interface) {
     MAGIC_ASSERT(interface);
-    return interface->bwDownKiBps;
+
+    SimulationTime timeFactor = SIMTIME_ONE_SECOND / _networkinterface_getRefillIntervalReceive();
+    guint64 bytesPerSecond = ((guint64)interface->receiveBucket.bytesRefill) * ((guint64)timeFactor);
+    guint64 kibPerSecond = bytesPerSecond / 1024;
+
+    return (guint32)kibPerSecond;
 }
 
 static gchar* _networkinterface_getAssociationKey(NetworkInterface* interface,
@@ -266,137 +338,88 @@ static void _networkinterface_capturePacket(NetworkInterface* interface, Packet*
     g_free(pcapPacket);
 }
 
-static void _networkinterface_runReceievedTask(NetworkInterface* interface, gpointer userData) {
-    networkinterface_received(interface);
-}
-
-static void _networkinterface_scheduleNextReceive(NetworkInterface* interface) {
-    /* the next packets need to be received and processed */
-    SimulationTime batchTime = options_getInterfaceBatchTime(worker_getOptions());
-
-    gboolean bootstrapping = worker_isBootstrapActive();
-
-    /* receive packets in batches */
-    while(!g_queue_is_empty(interface->inBuffer) &&
-            interface->receiveNanosecondsConsumed <= batchTime) {
-        /* get the next packet */
-        Packet* packet = g_queue_pop_head(interface->inBuffer);
-        utility_assert(packet);
-
-        /* successfully received */
-        packet_addDeliveryStatus(packet, PDS_RCV_INTERFACE_RECEIVED);
-
-        /* free up buffer space */
-        guint length = packet_getPayloadLength(packet) + packet_getHeaderSize(packet);
-        interface->inBufferLength -= length;
-
-        /* calculate how long it took to 'receive' this packet */
-        if(!bootstrapping) {
-            interface->receiveNanosecondsConsumed += (length * interface->timePerByteDown);
-        }
-
-        /* hand it off to the correct socket layer */
-        ProtocolType ptype = packet_getProtocol(packet);
-        in_port_t bindPort = packet_getDestinationPort(packet);
-
-        /* the first check is for servers who don't associate with specific destinations */
-        gchar* key = _networkinterface_getAssociationKey(interface, ptype, bindPort, 0, 0);
-        debug("looking for socket associated with general key %s", key);
-        Socket* socket = g_hash_table_lookup(interface->boundSockets, key);
-        g_free(key);
-
-        if(!socket) {
-            /* now check the destination-specific key */
-            in_addr_t peerIP = packet_getSourceIP(packet);
-            in_port_t peerPort = packet_getSourcePort(packet);
-
-            key = _networkinterface_getAssociationKey(interface, ptype, bindPort, peerIP, peerPort);
-            debug("looking for socket associated with specific key %s", key);
-            socket = g_hash_table_lookup(interface->boundSockets, key);
-            g_free(key);
-        }
-
-        /* if the socket closed, just drop the packet */
-        gint socketHandle = -1;
-        if(socket) {
-            socketHandle = *descriptor_getHandleReference((Descriptor*)socket);
-            socket_pushInPacket(socket, packet);
-        } else {
-            packet_addDeliveryStatus(packet, PDS_RCV_INTERFACE_DROPPED);
-        }
-
-        /* count our bandwidth usage by interface, and by socket handle if possible */
-        tracker_addInputBytes(host_getTracker(worker_getActiveHost()), packet, socketHandle);
-        if(interface->pcap) {
-            _networkinterface_capturePacket(interface, packet);
-        }
-
-        packet_unref(packet);
-    }
-
-    /*
-     * we need to call back and try to receive more, even if we didnt consume all
-     * of our batch time, because we might have more packets to receive then.
-     */
-    SimulationTime receiveTime = (SimulationTime) floor(interface->receiveNanosecondsConsumed);
-    if(receiveTime >= SIMTIME_ONE_NANOSECOND) {
-        /* we are 'receiving' the packets */
-        interface->flags |= NIF_RECEIVING;
-        /* call back when the packets are 'received' */
-        Task* receivedTask = task_new((TaskCallbackFunc)_networkinterface_runReceievedTask,
-                interface, NULL, NULL, NULL);
-        worker_scheduleTask(receivedTask, receiveTime);
-        task_unref(receivedTask);
-    }
-}
-
-void networkinterface_packetArrived(NetworkInterface* interface, Packet* packet) {
+static void _networkinterface_receivePacket(NetworkInterface* interface, Packet* packet) {
     MAGIC_ASSERT(interface);
 
-    /* a packet arrived. lets try to receive or buffer it.
-     * we don't drop control-only packets, so don't include header size in length */
-    guint length = packet_getPayloadLength(packet);// + packet_getHeaderSize(packet);
-    gssize space = interface->inBufferSize - interface->inBufferLength;
-    utility_assert(space >= 0);
+    /* get the next packet */
+    utility_assert(packet);
 
-    /* we don't drop control packets */
-    if(length <= space) {
-        /* we have space to buffer it */
-        packet_ref(packet);
-        g_queue_push_tail(interface->inBuffer, packet);
-        interface->inBufferLength += length;
-        packet_addDeliveryStatus(packet, PDS_RCV_INTERFACE_BUFFERED);
+    /* successfully received */
+    packet_addDeliveryStatus(packet, PDS_RCV_INTERFACE_RECEIVED);
 
-        /* we need a trigger if we are not currently receiving */
-        if(!(interface->flags & NIF_RECEIVING)) {
-            _networkinterface_scheduleNextReceive(interface);
-        }
+    /* hand it off to the correct socket layer */
+    ProtocolType ptype = packet_getProtocol(packet);
+    in_port_t bindPort = packet_getDestinationPort(packet);
+
+    /* the first check is for servers who don't associate with specific destinations */
+    gchar* key = _networkinterface_getAssociationKey(interface, ptype, bindPort, 0, 0);
+    debug("looking for socket associated with general key %s", key);
+    Socket* socket = g_hash_table_lookup(interface->boundSockets, key);
+    g_free(key);
+
+    if(!socket) {
+        /* now check the destination-specific key */
+        in_addr_t peerIP = packet_getSourceIP(packet);
+        in_port_t peerPort = packet_getSourcePort(packet);
+
+        key = _networkinterface_getAssociationKey(interface, ptype, bindPort, peerIP, peerPort);
+        debug("looking for socket associated with specific key %s", key);
+        socket = g_hash_table_lookup(interface->boundSockets, key);
+        g_free(key);
+    }
+
+    /* if the socket closed, just drop the packet */
+    gint socketHandle = -1;
+    if(socket) {
+        socketHandle = *descriptor_getHandleReference((Descriptor*)socket);
+        socket_pushInPacket(socket, packet);
     } else {
-        /* buffers are full, drop packet */
         packet_addDeliveryStatus(packet, PDS_RCV_INTERFACE_DROPPED);
     }
+
+    /* count our bandwidth usage by interface, and by socket handle if possible */
+    tracker_addInputBytes(host_getTracker(worker_getActiveHost()), packet, socketHandle);
+    if(interface->pcap) {
+        _networkinterface_capturePacket(interface, packet);
+    }
 }
 
-void networkinterface_received(NetworkInterface* interface) {
+void networkinterface_receivePackets(NetworkInterface* interface) {
     MAGIC_ASSERT(interface);
 
-    /* we just finished receiving some packets */
-    interface->flags &= ~NIF_RECEIVING;
-
-    /* decide how much delay we get to absorb based on the passed time */
-    SimulationTime now = worker_getCurrentTime();
-    SimulationTime absorbInterval = now - interface->lastTimeReceived;
-
-    if(absorbInterval > 0) {
-        /* decide how much delay we get to absorb based on the passed time */
-        gdouble newConsumed = interface->receiveNanosecondsConsumed - absorbInterval;
-        interface->receiveNanosecondsConsumed = MAX(0, newConsumed);
+    /* we can only receive packets from the upstream router if we actually have one.
+     * sending on loopback means we don't have a router, sending to a remote host
+     * means we do have a router. */
+    if(!interface->router) {
+        return;
     }
 
-    interface->lastTimeReceived = now;
+    /* get the bootstrapping mode */
+    gboolean bootstrapping = worker_isBootstrapActive();
 
-    /* now try to receive the next ones */
-    _networkinterface_scheduleNextReceive(interface);
+    while(bootstrapping || interface->receiveBucket.bytesRemaining >= CONFIG_MTU) {
+        /* we are now the owner of the packet reference from the router */
+        Packet* packet = router_dequeue(interface->router);
+        if(!packet) {
+            break;
+        }
+
+        guint64 length = (guint64)(packet_getPayloadLength(packet) + packet_getHeaderSize(packet));
+
+        _networkinterface_receivePacket(interface, packet);
+
+        /* release reference from router */
+        packet_unref(packet);
+
+        /* update bandwidth accounting when not in infinite bandwidth mode */
+        if(!bootstrapping) {
+            if(length > interface->receiveBucket.bytesRemaining) {
+                interface->receiveBucket.bytesRemaining = 0;
+            } else {
+                interface->receiveBucket.bytesRemaining -= length;
+            }
+        }
+    }
 }
 
 static void _networkinterface_updatePacketHeader(Descriptor* descriptor, Packet* packet) {
@@ -461,20 +484,13 @@ static Packet* _networkinterface_selectFirstInFirstOut(NetworkInterface* interfa
     return packet;
 }
 
-static void _networkinterface_runSentTask(NetworkInterface* interface, gpointer userData) {
-    networkinterface_sent(interface);
-}
-
-
-static void _networkinterface_scheduleNextSend(NetworkInterface* interface) {
-    /* the next packet needs to be sent according to bandwidth limitations.
-     * we need to spend time sending it before sending the next. */
-    SimulationTime batchTime = options_getInterfaceBatchTime(worker_getOptions());
+static void _networkinterface_sendPackets(NetworkInterface* interface) {
+    MAGIC_ASSERT(interface);
 
     gboolean bootstrapping = worker_isBootstrapActive();
 
     /* loop until we find a socket that has something to send */
-    while(interface->sendNanosecondsConsumed <= batchTime) {
+    while(interface->sendBucket.bytesRemaining >= CONFIG_MTU) {
         gint socketHandle = -1;
 
         /* choose which packet to send next based on our queuing discipline */
@@ -498,21 +514,28 @@ static void _networkinterface_scheduleNextSend(NetworkInterface* interface) {
 
         /* now actually send the packet somewhere */
         if(address_toNetworkIP(interface->address) == packet_getDestinationIP(packet)) {
-            /* packet will arrive on our own interface */
+            /* packet will arrive on our own interface, so it doesn't need to
+             * go through the upstream router and does not consume bandwidth. */
             packet_ref(packet);
-            Task* packetTask = task_new((TaskCallbackFunc)networkinterface_packetArrived,
+            Task* packetTask = task_new((TaskCallbackFunc)_networkinterface_receivePacket,
                     interface, packet, NULL, (TaskArgumentFreeFunc)packet_unref);
             worker_scheduleTask(packetTask, 1);
             task_unref(packetTask);
         } else {
-            /* let the worker send to remote with appropriate delays */
-            worker_sendPacket(packet);
+            /* let the upstream router send to remote with appropriate delays.
+             * if we get here we are not loopback and should have been assigned a router. */
+            utility_assert(interface->router);
+            router_forward(interface->router, packet);
         }
 
         /* successfully sent, calculate how long it took to 'send' this packet */
         if(!bootstrapping) {
             guint length = packet_getPayloadLength(packet) + packet_getHeaderSize(packet);
-            interface->sendNanosecondsConsumed += (length * interface->timePerByteUp);
+            if(length >= interface->sendBucket.bytesRemaining) {
+                interface->sendBucket.bytesRemaining = 0;
+            } else {
+                interface->sendBucket.bytesRemaining -= length;
+            }
         }
 
         tracker_addOutputBytes(host_getTracker(worker_getActiveHost()), packet, socketHandle);
@@ -522,21 +545,6 @@ static void _networkinterface_scheduleNextSend(NetworkInterface* interface) {
 
         /* sending side is done with its ref */
         packet_unref(packet);
-    }
-
-    /*
-     * we need to call back and try to send more, even if we didnt consume all
-     * of our batch time, because we might have more packets to send then.
-     */
-    SimulationTime sendTime = (SimulationTime) floor(interface->sendNanosecondsConsumed);
-    if(sendTime >= SIMTIME_ONE_NANOSECOND) {
-        /* we are 'sending' the packets */
-        interface->flags |= NIF_SENDING;
-        /* call back when the packets are 'sent' */
-        Task* sentTask = task_new((TaskCallbackFunc)_networkinterface_runSentTask,
-                interface, NULL, NULL, NULL);
-        worker_scheduleTask(sentTask, sendTime);
-        task_unref(sentTask);
     }
 }
 
@@ -562,29 +570,92 @@ void networkinterface_wantsSend(NetworkInterface* interface, Socket* socket) {
         }
     }
 
-    /* trigger a send if we are currently idle */
-    if(!(interface->flags & NIF_SENDING)) {
-        _networkinterface_scheduleNextSend(interface);
+    /* send packets if we can */
+    _networkinterface_sendPackets(interface);
+}
+
+void networkinterface_setRouter(NetworkInterface* interface, Router* router) {
+    MAGIC_ASSERT(interface);
+    if(interface->router) {
+        router_unref(interface->router);
+    }
+    interface->router = router;
+    if(interface->router) {
+        router_ref(interface->router);
     }
 }
 
-void networkinterface_sent(NetworkInterface* interface) {
+Router* networkinterface_getRouter(NetworkInterface* interface) {
+    MAGIC_ASSERT(interface);
+    return interface->router;
+}
+
+NetworkInterface* networkinterface_new(Address* address, guint64 bwDownKiBps, guint64 bwUpKiBps,
+        gboolean logPcap, gchar* pcapDir, QDiscMode qdisc, guint64 interfaceReceiveLength) {
+    NetworkInterface* interface = g_new0(NetworkInterface, 1);
+    MAGIC_INIT(interface);
+
+    interface->address = address;
+    address_ref(interface->address);
+
+    /* incoming packets get passed along to sockets */
+    interface->boundSockets = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, descriptor_unref);
+
+    /* sockets tell us when they want to start sending */
+    interface->rrQueue = g_queue_new();
+    interface->fifoQueue = priorityqueue_new((GCompareDataFunc)_networkinterface_compareSocket, NULL, descriptor_unref);
+
+    /* parse queuing discipline */
+    interface->qdisc = (qdisc == QDISC_MODE_NONE) ? QDISC_MODE_FIFO : qdisc;
+
+    if(logPcap) {
+        GString* filename = g_string_new(NULL);
+        g_string_printf(filename, "%s-%s",
+                address_toHostName(interface->address),
+                address_toHostIPString(interface->address));
+        interface->pcap = pcapwriter_new(pcapDir, filename->str);
+        g_string_free(filename, TRUE);
+    }
+
+    /* set size and refill rates for token buckets */
+    _networkinterface_setupTokenBuckets(interface, bwDownKiBps, bwUpKiBps);
+
+    info("bringing up network interface '%s' at '%s', %"G_GUINT64_FORMAT" KiB/s up and %"G_GUINT64_FORMAT" KiB/s down using queuing discipline %s",
+            address_toHostName(interface->address), address_toHostIPString(interface->address), bwUpKiBps, bwDownKiBps,
+            interface->qdisc == QDISC_MODE_RR ? "rr" : "fifo");
+
+    worker_countObject(OBJECT_TYPE_NETIFACE, COUNTER_TYPE_NEW);
+    return interface;
+}
+
+void networkinterface_free(NetworkInterface* interface) {
     MAGIC_ASSERT(interface);
 
-    /* we just finished sending some packets */
-    interface->flags &= ~NIF_SENDING;
+    /* unref all sockets wanting to send */
+    while(interface->rrQueue && !g_queue_is_empty(interface->rrQueue)) {
+        Socket* socket = g_queue_pop_head(interface->rrQueue);
+        descriptor_unref(socket);
+    }
+    g_queue_free(interface->rrQueue);
 
-    /* decide how much delay we get to absorb based on the passed time */
-    SimulationTime now = worker_getCurrentTime();
-    SimulationTime absorbInterval = now - interface->lastTimeSent;
+    priorityqueue_free(interface->fifoQueue);
 
-    if(absorbInterval > 0) {
-        gdouble newConsumed = interface->sendNanosecondsConsumed - absorbInterval;
-        interface->sendNanosecondsConsumed = MAX(0, newConsumed);
+    g_hash_table_destroy(interface->boundSockets);
+
+    if(interface->router) {
+        router_unref(interface->router);
     }
 
-    interface->lastTimeSent = now;
+    dns_deregister(worker_getDNS(), interface->address);
+    address_unref(interface->address);
 
-    /* now try to send the next ones */
-    _networkinterface_scheduleNextSend(interface);
+    if(interface->pcap) {
+        pcapwriter_free(interface->pcap);
+    }
+
+    MAGIC_CLEAR(interface);
+    g_free(interface);
+
+    worker_countObject(OBJECT_TYPE_NETIFACE, COUNTER_TYPE_FREE);
 }
+
